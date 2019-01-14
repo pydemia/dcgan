@@ -60,7 +60,7 @@ def get_conv_output_size(input_size, filter_size, stride_size):
 
 
 # Model Classes --------------------------------------------------------------
-class AnoGAN(NeuralNetworkModel):
+class BEGAN(NeuralNetworkModel):
     """Varitional RNN.
 
     TBD
@@ -92,21 +92,19 @@ class AnoGAN(NeuralNetworkModel):
         # class_num=None,
         # z_dim=100,
         filter_dim=64,
-        end_size=1,
         # g_filter_dim=64,
         # d_filter_dim=64,
         g_fc_dim=1024,
         d_fc_dim=1024,
         batch_size=128,
         dropout=.3,
+        lr_decaying=True,
         buffer_size=1000,
         learning_rate=.0002,
-        label_smoothing=.1,
-        adam_beta1=.5,
+        adam_beta1=.8,
+        adam_beta2=.8,
         validation_ratio=.2,
-        discriminator_training_ratio=.5,
         ano_lambda_=.1,
-        use_featuremap=True,
         ):
 
         super().__init__()
@@ -153,20 +151,18 @@ class AnoGAN(NeuralNetworkModel):
         self.G_FC_DIM = g_fc_dim
         self.D_FC_DIM = d_fc_dim
         self.FILTER_DIM = filter_dim
-        self.END_SIZE = end_size
 
         self.BATCH_SIZE = batch_size              # Training Batch Size
         self.DROPOUT = dropout
+        self.LR_DECAYING = lr_decaying
         self.BUFFER_SIZE = buffer_size            # For tf.Dataset.suffle(buffer_size)
         self.LEARNING_RATE = learning_rate        # Learning rate (Fixed for now)
-        self.LABEL_SMOOTHING = label_smoothing
         self.ADAM_BETA1 = adam_beta1
+        self.ADAM_BETA2 = adam_beta2
         self.VALIDATION_RATIO = validation_ratio  # Validation Ratio
-        self.DISCRIMINATOR_TRAINING_RATIO = discriminator_training_ratio
         self.EPOCH_NUM = 0                        # Cumulative Epoch Number
 
         self.ANO_LAMBDA_ = ano_lambda_
-        self.USE_FEATUREMAP = use_featuremap
 
         self._x_input_tensor = None
         self._z_input_tensor = None
@@ -196,19 +192,20 @@ class AnoGAN(NeuralNetworkModel):
 
         tf.reset_default_graph()
 
-        # self.input(
-        #     batch_size=self.BATCH_SIZE,
-        #     input_x_dtype=self.input_x_dtype,
-        #     input_z_dtype=self.input_z_dtype,
-        #     input_x_shape=self.input_x_shape,
-        #     input_z_shape=self.input_z_shape,
-        #     is_training=True,
-        #     drop_remainder=False,
-        # )
+        self.input(
+            batch_size=self.BATCH_SIZE,
+            input_x_dtype=self.input_x_dtype,
+            input_z_dtype=self.input_z_dtype,
+            input_x_shape=self.input_x_shape,
+            input_z_shape=self.input_z_shape,
+            is_training=True,
+        )
 
-        self.build_DCGAN(
-            learning_rate = self.LEARNING_RATE,
-            adam_beta1 = self.ADAM_BETA1,
+        self.build_BEGAN(
+            lr_decaying=True,
+            learning_rate=self.LEARNING_RATE,
+            adam_beta1=self.ADAM_BETA1,
+            adam_beta2=self.ADAM_BETA2,
             dropout=self.DROPOUT,
         )
         # self.build_AnoGAN(
@@ -218,35 +215,6 @@ class AnoGAN(NeuralNetworkModel):
         #     ano_lambda_=self.ANO_LAMBDA_,
         #     use_featuremap=self.USE_FEATUREMAP,
         # )
-
-    def _in_test_phase(x, alt, is_training=False):
-        """Change Options or Layers by the training and the test mode.
-
-        Parameters
-        ----------
-        x
-            Parameters, Layers, etc.
-        alt
-            Alternatives of x.
-
-        is_training: boolean or tf.bool
-            Choose a mode between the training and the test.
-
-        """
-        return tf.cond(
-            is_training,
-            x,
-            alt,
-        )
-
-    def _bool_in_tf_runtime(bool_tensor):
-
-        bool = tf.cond(
-            bool_tensor,
-            lambda bool: True,
-            lambda bool: False,
-        )
-        return bool
 
 
     def _img_parse_fn(self, filenames, data_z):
@@ -341,12 +309,23 @@ class AnoGAN(NeuralNetworkModel):
             )
         )
 
-    def _parse_jpg(self, filename, z):
-        image_string = tf.read_file(filename)
-        image_decoded = tf.image.decode_jpeg(image_string)
-        # image_resized = tf.image.resize_images(image_decoded, [28, 28])
-        return image_decoded, z
+    def _print_parameter(
+        self,
+        parameter_dict,
+        ):
 
+        parameter_str = "\n".join(
+            f"| {prmt_key:18s}: {str(prmt_value):>8s} |"
+            #if isinstance(prmt_value, (int, float, complex))
+            #else f"{prmt_key:15s}\t: {prmt_value:>8s}"
+            for prmt_key, prmt_value in parameter_dict.items()
+        )
+        print(
+            "=" * 7 + " Given Parameters " +  "=" * 7,
+            parameter_str,
+            "=" * 32,
+            sep='\n',
+        )
 
     def input(
         self,
@@ -378,66 +357,51 @@ class AnoGAN(NeuralNetworkModel):
         >>> eval_input_spec = input_fn('evaluate', x_test, y_test)
 
         """
-        if batch_size is None:
-            batch_size = self.BATCH_SIZE
+        with tf.name_scope('input'):
+            if batch_size is None:
+                batch_size = self.BATCH_SIZE
 
-        buffer_size = self.BUFFER_SIZE if is_training else 1
+            buffer_size = self.BUFFER_SIZE if is_training else 1
 
-        assert self.INPUT_WIDTH == self.INPUT_HEIGHT
+            assert self.INPUT_WIDTH == self.INPUT_HEIGHT
 
-        # X_t = tf.placeholder(self.input_x_dtype, self.input_x_shape,
-        #                      name='x_tensor_interface')
-        X_t= tf.placeholder(tf.string, (None,),
-                             name='x_filename_interface')
-        Z_t = tf.placeholder(self.input_z_dtype, self.input_z_shape,
-                             name='z_tensor_interface')
+            # X_t = tf.placeholder(self.input_x_dtype, self.input_x_shape,
+            #                      name='x_tensor_interface')
+            X_file_t= tf.placeholder(tf.string, (None,),
+                                 name='x_filename_interface')
+            Z_t = tf.placeholder(self.input_z_dtype, self.input_z_shape,
+                                 name='z_tensor_interface')
 
-        dataset = tf.data.Dataset.from_tensor_slices((X_t, Z_t))
-        #dataset = tf.data.Dataset.from_tensor_slices((X_file_t, Z_t))
-        #dataset = dataset.map(self._img_parse_fn)
-        dataset = dataset.flat_map(
-            lambda data_x, data_z: tf.data.Dataset.zip(
-                (
-                    tf.data.Dataset.from_tensors(data_x),
-                    tf.data.Dataset.from_tensors(data_z),
-                )
-            )#.repeat(repeat_num)
-        )
-        dataset = dataset.map(self._parse_jpg)
-        dataset = dataset.shuffle(buffer_size=buffer_size)  # reshuffle_each_iteration=True as default.
-        dataset = dataset.batch(
-            batch_size,
-            drop_remainder=drop_remainder,
-        )
+            dataset = tf.data.Dataset.from_tensor_slices((X_file_t, Z_t))
+            dataset = dataset.map(self._img_parse_fn)
+            dataset = dataset.shuffle(buffer_size=buffer_size)  # reshuffle_each_iteration=True as default.
+            dataset = dataset.batch(
+                batch_size,
+                drop_remainder=drop_remainder,
+            )
+            dataset = dataset.flat_map(
+                lambda data_x, data_z: tf.data.Dataset.zip(
+                    (
+                        tf.data.Dataset.from_tensors(data_x),
+                        tf.data.Dataset.from_tensors(data_z),
+                    )
+                )#.repeat(repeat_num)
+            )
 
-        data_op = dataset.make_initializable_iterator()
-        data_init_op = data_op.initializer
-        next_batch = X_batch, Z_batch = data_op.get_next()
+            data_op = dataset.make_initializable_iterator()
+            data_init_op = data_op.initializer
+            next_batch = X_batch, Z_batch = data_op.get_next()
 
-        print('[dtype] X: %s , Z: %s' % (X_batch.dtype, Z_batch.dtype))
-        print('[shape] X: %s , Z: %s' % (X_batch.get_shape(), Z_batch.get_shape()))
+            print('[dtype] X: %s , Z: %s' % (X_batch.dtype, Z_batch.dtype))
+            print('[shape] X: %s , Z: %s' % (X_batch.get_shape(), Z_batch.get_shape()))
 
-        self._x_input_tensor = X_t
-        #self._x_input_filename_tensor = X_file_t
+        #self._x_input_tensor = X_t
+        self._x_input_filename_tensor = X_file_t
         self._z_input_tensor = Z_t
         self._x_batch_tensor = X_batch
         self._z_batch_tensor = Z_batch
         self.next_batch = next_batch
         self.data_init_op = data_init_op
-
-
-    def _get_conv_output_size(input_size, filter_size, stride_size):
-        "Assumption: Input & Filter are Square-shaped."
-        output_size = ((input_size - filter_size) / stride_size) + 1
-        return output_size
-
-    def _get_conv_stride_size(input_size, filter_size, output_size):
-        "Assumption: Input & Filter are Square-shaped."
-        stride_size = (input_size - filter_size) / (output_size - 1)
-        if (input_size - filter_size) % stride_size == 0:
-            return int(stride_size)
-        else:
-            raise Exception('Stride size should be an int.')
 
 
     def _layer_dense(
@@ -539,6 +503,7 @@ class AnoGAN(NeuralNetworkModel):
         batch_norm_ok=False,
         activation=None,
         dropout=.3,
+        return_weight=False,
         reuse=tf.AUTO_REUSE,
         name='linear',
         ):
@@ -630,7 +595,10 @@ class AnoGAN(NeuralNetworkModel):
             output_shape=final_layer.get_shape(),
         )
 
-        return final_layer
+        if return_weight:
+            return final_layer, weight, bias
+        else:
+            return final_layer
 
 
     def _layer_reshape(
@@ -724,11 +692,11 @@ class AnoGAN(NeuralNetworkModel):
         input_,
         output_size,
         is_training=True,
-        filter_size=5,
-        stride_size=2,
+        filter_size=3,
+        stride_size=1,
         stddev=.02,
         batch_norm_ok=True,
-        activation=tf.nn.leaky_relu,
+        activation=tf.nn.elu,
         dropout=.3,
         reuse=tf.AUTO_REUSE,
         name='conv2d',
@@ -874,11 +842,11 @@ class AnoGAN(NeuralNetworkModel):
         input_,
         output_size,
         is_training=True,
-        filter_size=5,
-        stride_size=2,
+        filter_size=3,
+        stride_size=1,
         stddev=.02,
         batch_norm_ok=True,
-        activation=tf.nn.relu,
+        activation=tf.nn.elu,
         dropout=.3,
         name='conv2d_t',
         reuse=tf.AUTO_REUSE,
@@ -1043,14 +1011,247 @@ class AnoGAN(NeuralNetworkModel):
         return final_layer
 
 
-    def _graph_generator(
+    def _subgraph_encoder(
+        self,
+        input_x,
+        # n,
+        # z_dim,
+        # channel_dim,
+        filter_size=3,
+        stride_size=1,
+        activation=tf.nn.elu,
+        dropout=None,
+        is_training=True,
+        reuse=tf.AUTO_REUSE,
+        name='encoder',
+        ):
+        """
+        Reconstruction network
+        """
+        # h = tf.layers.dense(input_h, img_dim * img_dim * n, activation=None)
+        # h = tf.reshape(h, (-1, img_dim, img_dim, n))
+        with tf.variable_scope(name, reuse=reuse):
+            output_size_arr = np.array(
+                [self.INPUT_HEIGHT, self.INPUT_WIDTH]
+            )
+            stacked_num = int(np.log2(self.INPUT_HEIGHT) - 2)
+            output_size_arr = np.array(
+                [output_size_arr // (2 ** i) for i in range(stacked_num)]
+            )
+            height_arr = output_size_arr[:, 0]
+            width_arr = output_size_arr[:, 1]
+
+
+            # channel_gen_x = self.OUTPUT_CHANNEL       #   3
+            # channel_4 = self.G_FILTER_DIM * (2 ** 0)  #  32
+            # channel_3 = self.G_FILTER_DIM * (2 ** 1)  #  64
+            # channel_2 = self.G_FILTER_DIM * (2 ** 2)  # 128
+            # channel_1 = self.G_FILTER_DIM * (2 ** 3)  # 256
+            # channel_0 = self.G_FILTER_DIM * (2 ** 4)  # 512
+            channel = self.FILTER_DIM
+
+
+            final_layer = input_x
+            for i in range(stacked_num - 1):
+                conv2d = self._layer_conv2d(
+                    final_layer,
+                    output_size=(
+                        None,
+                        height_arr[i],
+                        width_arr[i],
+                        channel * (2 ** i),
+                    ),
+                    filter_size=filter_size,
+                    stride_size=stride_size + 1,
+                    batch_norm_ok=False,
+                    activation=activation,
+                    dropout=dropout,
+                    name='d_sampling_%s' % (i),
+                    is_training=is_training,
+                )
+                final_layer = conv2d
+
+                for _ in range(3):
+                    conv2d = self._layer_conv2d(
+                        final_layer,
+                        output_size=(
+                            None,
+                            height_arr[i],
+                            width_arr[i],
+                            channel * (i + 2),
+                        ),
+                        filter_size=filter_size,
+                        stride_size=stride_size,
+                        batch_norm_ok=False,
+                        activation=activation,
+                        dropout=dropout,
+                        name='conv2d_%s_%s' % (i, _),
+                        is_training=is_training,
+                    )
+                    final_layer = conv2d
+
+            projection_size = np.prod(final_layer.shape[1:])
+            reshaped_proj_z = self._layer_reshape(
+                final_layer,
+                output_shape=(
+                    -1,  # `tf.reshape` needs -1, not `None`
+                    projection_size,
+                ),
+                batch_norm_ok=False,
+                activation=None,
+                dropout=dropout,
+                name='reshaped_proj_z',
+                is_training=is_training,
+            )
+            encoded = self._layer_dense(
+                reshaped_proj_z,
+                output_size=self.Z_DIM,
+                batch_norm_ok=False,
+                activation=None,
+                dropout=dropout,
+                is_training=is_training,
+                name='proj_z_dense',
+            )
+            final_layer = encoded
+
+        return final_layer
+
+
+    def _subgraph_decoder(
         self,
         input_z,
+        # n,
+        # img_dim,
+        # channel_dim,
+        filter_size=3,
+        stride_size=1,
+        activation=tf.nn.elu,
+        dropout=None,
         is_training=True,
-        filter_size=5,
-        stride_size=2,
-        dropout=.3,
-        conv_activation=tf.nn.relu,
+        reuse=tf.AUTO_REUSE,
+        name='decoder',
+        ):
+        """
+        Reconstruction network
+        """
+        # h = tf.layers.dense(input_h, img_dim * img_dim * n, activation=None)
+        # h = tf.reshape(h, (-1, img_dim, img_dim, n))
+        with tf.variable_scope(name, reuse=reuse):
+            output_size_arr = np.array(
+                [self.OUTPUT_HEIGHT, self.OUTPUT_WIDTH]
+            )
+            stacked_num = int(np.log2(self.OUTPUT_HEIGHT) - 2)
+            output_size_arr = np.array(
+                [output_size_arr // (2 ** i) for i in range(stacked_num)]
+            )[::-1]
+            height_arr = output_size_arr[:, 0]
+            width_arr = output_size_arr[:, 1]
+
+
+            # channel_gen_x = self.OUTPUT_CHANNEL       #   3
+            # channel_4 = self.G_FILTER_DIM * (2 ** 0)  #  32
+            # channel_3 = self.G_FILTER_DIM * (2 ** 1)  #  64
+            # channel_2 = self.G_FILTER_DIM * (2 ** 2)  # 128
+            # channel_1 = self.G_FILTER_DIM * (2 ** 3)  # 256
+            # channel_0 = self.G_FILTER_DIM * (2 ** 4)  # 512
+            channel = self.FILTER_DIM
+
+
+            projection_size = (
+                height_arr[0] * width_arr[0] * channel
+            )
+            proj_z = self._layer_dense(
+                input_z,
+                output_size=projection_size,
+                batch_norm_ok=False,
+                activation=None,
+                dropout=dropout,
+                is_training=is_training,
+                name='proj_z_dense',
+            )
+            reshaped_proj_z = self._layer_reshape(
+                proj_z,
+                output_shape=(
+                    -1,  # `tf.reshape` needs -1, not `None`
+                    height_arr[0],
+                    width_arr[0],
+                    channel,
+                ),
+                batch_norm_ok=False,
+                activation=None,
+                dropout=dropout,
+                name='reshaped_proj_z',
+                is_training=is_training,
+            )
+            final_layer = reshaped_proj_z
+
+            for i in range(stacked_num):
+                if i > 0:
+                    upsample_name = 'upsampling_%s' % i
+                    with tf.variable_scope(upsample_name):
+                        resized = tf.image.resize_nearest_neighbor(
+                            images=final_layer,
+                            size=[height_arr[i], width_arr[i]],
+                            name=upsample_name,
+                        )
+                        self._print_layer(
+                            name=upsample_name,
+                            input_shape=final_layer.get_shape(),
+                            output_shape=resized.get_shape(),
+                        )
+
+                    final_layer = resized
+
+                for _ in range(2):
+                    conv2d = self._layer_conv2d(
+                        final_layer,
+                        output_size=(
+                            None,
+                            height_arr[i],
+                            width_arr[i],
+                            channel,
+                        ),
+                        filter_size=filter_size,
+                        stride_size=stride_size,
+                        batch_norm_ok=False,
+                        activation=activation,
+                        dropout=dropout,
+                        name='conv2d_%s_%s' % (i, _),
+                        is_training=is_training,
+                    )
+                    final_layer = conv2d
+
+            decoded = self._layer_conv2d(
+                final_layer,
+                output_size=(
+                    None,
+                    height_arr[i],
+                    width_arr[i],
+                    self.OUTPUT_CHANNEL,
+                ),
+                filter_size=filter_size,
+                stride_size=stride_size,
+                batch_norm_ok=False,
+                activation=None,
+                # activation=tf.nn.tanh,
+                # activation=tf.nn.sigmoid,
+                dropout=dropout,
+                name='conv2d_%s' % (i + 1),
+                is_training=is_training,
+            )
+            final_layer = decoded
+
+        return final_layer
+
+
+    def _graph_generator(
+        self,
+        z,
+        is_training=True,
+        # filter_size=5,
+        # stride_size=2,
+        dropout=None,
+        activation=tf.nn.elu,
         reuse=tf.AUTO_REUSE,
         name='generator',
         ):
@@ -1059,129 +1260,25 @@ class AnoGAN(NeuralNetworkModel):
 
         with tf.variable_scope(name, reuse=reuse):
 
-            # Transposed Convolutional Layer Size
-            output_size_arr = np.array(
-                [self.OUTPUT_HEIGHT, self.OUTPUT_WIDTH]
-            )
-            #stacked_num = int(np.log2(self.OUTPUT_HEIGHT) - 1)
-            stacked_num = max(
-                int(
-                    np.log2(self.OUTPUT_HEIGHT) - np.log2(self.END_SIZE) + 1
-                ),
-                2,
-            )
-            output_size_arr = np.array(
-                [output_size_arr // (2 ** i) for i in range(stacked_num)]
-            )[::-1]
-            height_arr = output_size_arr[:, 0]
-            width_arr = output_size_arr[:, 1]
-
-            # projection_size = height_0 * width_0 * self.G_FILTER_DIM * 8
-            # projection_size = height_0 * width_0 * channel_0
-            #stacked_num_ch = int(np.log2(self.FILTER_DIM) - 2)
-            channel_arr = np.array(
-                [self.G_FILTER_DIM * (2 ** i) for i in range(stacked_num - 1)]
-            )[::-1]
-
-            projection_size = (
-                height_arr[0] * width_arr[0] * channel_arr[1]
-            )
-
-            for i in range(stacked_num - 1):
-
-                if i <= 0:
-                    proj_z = self._layer_dense(
-                        input_z,
-                        output_size=projection_size,
-                        batch_norm_ok=False,
-                        activation=None,
-                        dropout=dropout,
-                        is_training=is_training,
-                        name='proj_z_dense',
-                    )
-                    reshaped_proj_z = self._layer_reshape(
-                        proj_z,
-                        output_shape=(
-                            -1,  # `tf.reshape` needs -1, not `None`
-                            height_arr[i],
-                            width_arr[i],
-                            channel_arr[i + 1],
-                        ),
-                        batch_norm_ok=True,
-                        activation=conv_activation,
-                        dropout=dropout,
-                        name='reshaped_proj_z',
-                        is_training=is_training,
-                    )
-                    conv2d_t_0_1x1 = self._layer_conv2d_t(
-                        reshaped_proj_z,
-                        output_size=(
-                            None,
-                            height_arr[i],
-                            width_arr[i],
-                            channel_arr[i],
-                        ),
-                        filter_size=1,
-                        stride_size=1,
-                        batch_norm_ok=True,
-                        activation=conv_activation,
-                        dropout=dropout,
-                        name='conv2d_t_0_1x1',
-                        is_training=is_training,
-                    )
-                    final_layer = conv2d_t_0_1x1
-
-                else:
-                    conv2d_t = self._layer_conv2d_t(
-                        final_layer,
-                        output_size=(
-                            None,
-                            height_arr[i],
-                            width_arr[i],
-                            channel_arr[i],
-                        ),
-                        filter_size=filter_size,
-                        stride_size=stride_size,
-                        batch_norm_ok=True,
-                        activation=conv_activation,
-                        dropout=dropout,
-                        name='conv2d_t_%s' % i,
-                        is_training=is_training,
-                    )
-                    final_layer = conv2d_t
-
-            generated_x = self._layer_conv2d_t(
-                final_layer,
-                output_size=(
-                    None,
-                    height_arr[i + 1],
-                    width_arr[i + 1],
-                    self.OUTPUT_CHANNEL,
-                ),
-                filter_size=filter_size,
-                stride_size=stride_size,
-                batch_norm_ok=False,
-                activation=None,
-                dropout=dropout,
-                name='generated_x',
+            decoded = self._subgraph_decoder(
+                z,
                 is_training=is_training,
-            )
-            activated_x = tf.nn.tanh(
-                generated_x,
-                name='generator_tanh',
+                activation=activation,
+                dropout=dropout,
+                reuse=reuse,
             )
 
-        return activated_x
+        return decoded
 
 
     def _graph_discriminator(
         self,
         input_x,
         is_training=True,
-        filter_size=5,
-        stride_size=2,
-        dropout=.3,
-        conv_activation=tf.nn.leaky_relu,
+        # filter_size=5,
+        # stride_size=2,
+        dropout=None,
+        activation=tf.nn.elu,
         reuse=tf.AUTO_REUSE,
         name='discriminator',
         return_all_layers=False,
@@ -1191,160 +1288,46 @@ class AnoGAN(NeuralNetworkModel):
 
         with tf.variable_scope(name, reuse=reuse):
 
-            # Convolutional Layer Size
-            output_size_arr = np.array(
-                [self.OUTPUT_HEIGHT, self.OUTPUT_WIDTH]
-            )
-            stacked_num = max(
-                int(
-                    np.log2(self.OUTPUT_HEIGHT) - np.log2(self.END_SIZE) + 1
-                ),
-                2,
-            )
-            output_size_arr = np.array(
-                [output_size_arr // (2 ** i) for i in range(stacked_num)]
-            )
-            height_arr = output_size_arr[:, 0]
-            width_arr = output_size_arr[:, 1]
-
-            # projection_size = height_0 * width_0 * self.G_FILTER_DIM * 8
-            # projection_size = height_0 * width_0 * channel_0
-            #stacked_num_ch = int(np.log2(self.FILTER_DIM) - 2)
-            channel_arr = np.array(
-                [self.G_FILTER_DIM * (2 ** i) for i in range(stacked_num)]
-            )
-
-            projection_size = (
-                height_arr[0] * width_arr[0] * channel_arr[1]
-            )
-
-            layer_list = []
-            for i in range(stacked_num - 1):
-
-                if i <= 0:
-                    conv2d = self._layer_conv2d(
-                        input_x,
-                        output_size=(
-                            None,
-                            height_arr[i],
-                            width_arr[i],
-                            channel_arr[i],
-                        ),
-                        filter_size=filter_size,
-                        stride_size=stride_size,
-                        batch_norm_ok=False,
-                        activation=conv_activation,
-                        dropout=dropout,
-                        name='conv2d_%s' % i,
-                        is_training=is_training,
-                    )
-                    final_layer = conv2d
-                    layer_list += [final_layer]
-
-                else:
-
-                    conv2d = self._layer_conv2d(
-                        final_layer,
-                        output_size=(
-                            None,
-                            height_arr[i],
-                            width_arr[i],
-                            channel_arr[i],
-                        ),
-                        filter_size=filter_size,
-                        stride_size=stride_size,
-                        batch_norm_ok=True,
-                        activation=conv_activation,
-                        dropout=dropout,
-                        name='conv2d_%s' % i,
-                        is_training=is_training,
-                    )
-                    final_layer = conv2d
-                    layer_list += [final_layer]
-
-            conv2d_1x1 = self._layer_conv2d(
-                final_layer,
-                output_size=(
-                    None,
-                    height_arr[i],
-                    width_arr[i],
-                    channel_arr[i - 1],
-                ),
-                filter_size=1,
-                stride_size=1,
-                batch_norm_ok=True,
-                activation=conv_activation,
-                dropout=dropout,
-                name='conv2d_%s_1x1' % (i + 1),
+            encoded = self._subgraph_encoder(
+                input_x,
                 is_training=is_training,
-            )
-            final_layer = conv2d_1x1
-            layer_list += [final_layer]
-
-            projection_size = np.prod(conv2d_1x1.shape[1:])
-            reshaped_proj_y = self._layer_reshape(
-                conv2d_1x1,
-                output_shape=(
-                    -1,  # `tf.reshape` needs -1, not `None`
-                    projection_size,
-                ),
-                batch_norm_ok=False,
-                activation=None,
+                activation=activation,
                 dropout=dropout,
-                name='reshaped_proj_y',
-                is_training=is_training,
+                reuse=reuse,
             )
-
-            # y = self._layer_linear(
-            #    reshaped_proj_y,
-            #    output_size=1,
-            #    batch_norm_ok=False,
-            #    activation=None,
-            #    dropout=dropout,
-            #    is_training=is_training,
-            #    name='proj_y_linear',
-            #    return_weight=False,
-            # )
-            # y_0 = self._layer_dense(
-            #     reshaped_proj_y,
-            #     output_size=int(projection_size / (2 ** 1)),
-            #     batch_norm_ok=False,
-            #     activation=conv_activation,
-            #     dropout=dropout,
-            #     is_training=is_training,
-            #     name='proj_y_dense_0',
-            # )
-            y = self._layer_dense(
-                reshaped_proj_y,
-                output_size=1,
-                batch_norm_ok=False,
-                activation=None,
+            decoded = self._subgraph_decoder(
+                encoded,
+                is_training=is_training,
+                activation=activation,
                 dropout=dropout,
-                is_training=is_training,
-                name='proj_y_dense',
+                reuse=reuse,
             )
-            final_layer = y
-            layer_list += [final_layer]
 
-            activated_y = tf.nn.sigmoid(
-                y,
-                name='sigmoid',
-            )
-            final_layer = activated_y
-            layer_list += [final_layer]
+        return decoded
 
         if return_all_layers:
-            return layer_list
+            return None
+            # return (
+            #     conv2d_0,
+            #     conv2d_1,
+            #     conv2d_2,
+            #     conv2d_3,
+            #     conv2d_4,
+            #     conv2d_4_1x1,
+            #     reshaped_proj_y,
+            #     y,
+            #     activated_y,
+            # )
         else:
-            return activated_y, y
+            return decoded
 
     def _graph_sampler(
         self,
         z,
         is_training=False,
-        filter_size=5,
-        stride_size=2,
-        dropout=.3,
+        # filter_size=5,
+        # stride_size=2,
+        dropout=None,
         name='sampler',
         generator_name='generator',
         ):
@@ -1355,8 +1338,8 @@ class AnoGAN(NeuralNetworkModel):
             sample_G = self._graph_generator(
                 z,
                 is_training=is_training,
-                filter_size=filter_size,
-                stride_size=stride_size,
+                # filter_size=filter_size,
+                # stride_size=stride_size,
                 reuse=True,
                 dropout=dropout,
                 name=generator_name,
@@ -1369,9 +1352,9 @@ class AnoGAN(NeuralNetworkModel):
         self,
         input_x,
         is_training=False,
-        filter_size=5,
-        stride_size=2,
-        dropout=.3,
+        # filter_size=5,
+        # stride_size=2,
+        dropout=None,
         name='discriminator_featuremap',
         discriminator_name='discriminator',
         return_layer_idx=3,
@@ -1391,8 +1374,8 @@ class AnoGAN(NeuralNetworkModel):
             layers = self._graph_discriminator(
                 input_x,
                 is_training=is_training,
-                filter_size=filter_size,
-                stride_size=stride_size,
+                # filter_size=filter_size,
+                # stride_size=stride_size,
                 dropout=dropout,
                 reuse=True,
                 name=discriminator_name,
@@ -1425,11 +1408,13 @@ class AnoGAN(NeuralNetworkModel):
         return anomaly_z
 
 
-    def build_DCGAN(
+    def build_BEGAN(
         self,
+        lr_decaying=True,
         learning_rate=.0002,
         adam_beta1=.5,
-        dropout=.3,
+        adam_beta2=.8,
+        dropout=None,
         ):
         """Short Description.
 
@@ -1457,50 +1442,60 @@ class AnoGAN(NeuralNetworkModel):
         # X_batch = self._x_batch_tensor
         # Z_batch = self._z_batch_tensor
 
-        print('\n[  DCGAN_MODEL  ] ' + '=' * 47)
+        print('\n[  began_MODEL  ] ' + '=' * 47)
 
         # Objective Functions ================================================
 
-        with tf.variable_scope('dcgan_model', reuse=reuse_ok):
+        with tf.variable_scope('began_model', reuse=reuse_ok):
 
-            # Input_X_dcgan = tf.placeholder(
+            # Input_X_began = tf.placeholder(
             #     self._x_input_tensor.dtype,
             #     self._x_input_tensor.get_shape(),
-            #     name='input_x_dcgan',
+            #     name='input_x_began',
             # )
-            Input_X_dcgan = tf.placeholder(
+            Input_X_began = tf.placeholder(
                 self.input_x_dtype,
                 self.input_x_shape,
-                name='input_x_dcgan',
+                name='input_x_began',
             )
-            Input_Z_dcgan = tf.placeholder(
+            Input_Z_began = tf.placeholder(
                 self._z_input_tensor.dtype,
                 self._z_input_tensor.get_shape(),
-                name='input_z_dcgan',
+                name='input_z_began',
             )
             Bool_is_training = tf.placeholder(
                 tf.bool,
                 (None),  #[None, 1],
-                name='Bool_is_training',
+                name='bool_is_training',
             )
-            Ratio_label_smoothing = tf.placeholder(
+            Input_lambda = tf.placeholder(
                 tf.float32,
                 (None),  #[None, 1],
-                name='Ratio_label_smoothing',
+                name='input_lambda',
+            )
+            Input_gamma = tf.placeholder(
+                tf.float32,
+                (None),  #[None, 1],
+                name='input_gamma',
+            )
+            Start_learning_rate_tensor = tf.placeholder(
+                tf.float32,
+                (None),
+                name='start_learning_rate_tensor',
             )
             G = self._graph_generator(
-                Input_Z_dcgan,  # z=Z_batch,
-                filter_size=5,
-                stride_size=2,
+                z=Input_Z_began,  # z=Z_batch,
+                # filter_size=5,
+                # stride_size=2,
                 dropout=dropout,
                 is_training=Bool_is_training,
                 name='generator',
             )
-            D_real_sigmoid_y, D_real_y = self._graph_discriminator(
+            D_real_y = self._graph_discriminator(
             #D_real_sigmoid_y = self._graph_discriminator(
-                input_x=Input_X_dcgan,  # input_x=X_batch,
-                filter_size=5,
-                stride_size=2,
+                input_x=Input_X_began,  # input_x=X_batch,
+                # filter_size=5,
+                # stride_size=2,
                 dropout=dropout,
                 is_training=Bool_is_training,
                 reuse=tf.AUTO_REUSE,
@@ -1508,16 +1503,16 @@ class AnoGAN(NeuralNetworkModel):
                 return_all_layers=False,
             )
             # S = self._graph_sampler(
-            #     z=Input_Z_dcgan,  # z=Z_batch,
+            #     z=Input_Z_began,  # z=Z_batch,
             #     filter_size=5,
             #     stride_size=2,
             #     generator_name='generator',
             # )
-            D_fake_sigmoid_y, D_fake_y = self._graph_discriminator(
+            D_fake_y = self._graph_discriminator(
             #D_fake_sigmoid_y = self._graph_discriminator(
                 input_x=G,
-                filter_size=5,
-                stride_size=2,
+                # filter_size=5,
+                # stride_size=2,
                 dropout=dropout,
                 is_training=Bool_is_training,
                 reuse=True,
@@ -1526,89 +1521,87 @@ class AnoGAN(NeuralNetworkModel):
             )
             #G_to_img_rgb = (G + 1.) / 2. * 255.
 
-            summary_Z = tf.summary.histogram('z', Input_Z_dcgan)
-            #summary_G_img = tf.summary.image('G', G)
-            #summary_G_img_batch = tf.summary.image('G_to_img_batch', G)
+            summary_Z = tf.summary.histogram('z', Input_Z_began)
+            summary_G_img = tf.summary.image('G', G)
+            summary_G_img_batch = tf.summary.image('G_to_img_batch', G)
             #summary_G_img = tf.summary.image('G_to_img', G_to_img)
             summary_D_real = tf.summary.histogram('D_real', D_real_y)
             summary_D_fake = tf.summary.histogram('D_fake', D_fake_y)
 
-            with tf.name_scope('loss_G_scope'):
-                loss_G = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=D_fake_y,
-                        labels=tf.ones_like(
-                            D_fake_sigmoid_y,
-                            name='D_fake_as_correct'
-                        ),
-                        name='generator_correct_score',
-                    )
-                )
 
-            with tf.name_scope('loss_D_scope'):
-                loss_D_real = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=D_real_y,
-                        labels=tf.ones_like(
-                            D_real_sigmoid_y,
-                            name='D_real_as_correct'
-                        ) * (
-                            1. - (
-                                tf.to_float(Bool_is_training) *
-                                Ratio_label_smoothing
+            with tf.variable_scope('loss', reuse=tf.AUTO_REUSE):
+
+                def pixel_autoencoder_loss(out, inp):
+                            '''
+                            The autoencoder loss used is the L1 norm
+                            (note that this is based on the pixel-wise
+                            distribution of losses that the authors assert
+                            approximates the Normal distribution)
+                            args:
+                                out:  discriminator output
+                                inp:  discriminator input
+                            returns:
+                                L1 norm of pixel-wise loss
+                            '''
+                            eta = 1  # paper uses L1 norm
+                            diff = tf.abs(out - inp)
+                            if eta == 1:
+                                return tf.reduce_mean(diff)
+                            else:
+                                return tf.reduce_mean(tf.pow(diff, eta))
+
+                pxl_loss_real = pixel_autoencoder_loss(D_real_y, Input_X_began)
+                pxl_loss_fake = pixel_autoencoder_loss(D_fake_y, G)
+                K = tf.get_variable(
+                                name='K',
+                                shape=[],
+                                initializer=tf.constant_initializer(0.),
+                                trainable=False,
                             )
-                        ),
-                        name='discriminator_correct_score',
+                with tf.name_scope('loss_G_scope'):
+                    loss_G = pxl_loss_fake
+
+                with tf.name_scope('loss_D_scope'):
+                    loss_D = pxl_loss_real - (K * pxl_loss_fake)
+
+                with tf.name_scope('k_update'):
+                    balance = (Input_gamma * pxl_loss_real) - pxl_loss_fake
+                    K_next = K + (Input_lambda * balance)
+                    update_K = tf.assign(
+                        K,
+                        tf.clip_by_value(K_next, 0., 1.),
                     )
-                )
-                loss_D_fake = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=D_fake_y,
-                        # labels=tf.zeros_like(
-                        #     D_fake_sigmoid_y,
-                        #     name='D_fake_as_wrong'
-                        # ),
-                        labels=tf.ones_like(
-                            D_fake_sigmoid_y,
-                            name='D_fake_as_wrong'
-                        ) * (
-                            tf.to_float(Bool_is_training) *
-                            Ratio_label_smoothing
-                        ),
-                        name='discriminator_fault_score',
-                    )
-                )
-                loss_D = tf.add(
-                    # .5 * loss_D_real,
-                    # .5 * loss_D_fake,
-                    loss_D_real,
-                    loss_D_fake,
-                    name='discriminator_true_score',
-                )
+                with tf.name_scope('convergence_measure'):
+                    convergence_measure = pxl_loss_real + np.abs(balance)
 
             summary_loss_G = tf.summary.scalar('loss_G', loss_G)
-            summary_loss_D_real = tf.summary.scalar('loss_D_real', loss_D_real)
-            summary_loss_D_fake = tf.summary.scalar('loss_D_fake', loss_D_fake)
             summary_loss_D = tf.summary.scalar('loss_D', loss_D)
+            summary_K = tf.summary.scalar('K', K)
+            summary_balance = tf.summary.scalar('balance', balance)
+            summary_convergence_measure = tf.summary.scalar(
+                'Convergence_measure',
+                convergence_measure,
+            )
 
         # Summaries for training
         # summary_op = tf.summary.merge_all()
         summary_op_G = tf.summary.merge([
             summary_Z,
-            #summary_G_img,
+            summary_G_img,
             summary_loss_G,
+            summary_K,
+            summary_balance,
+            summary_convergence_measure,
         ])
-        # summary_op_G_batch = tf.summary.merge(
-        #     [
-        #         #summary_G_img_batch,
-        #     ],
-        # )
+        summary_op_G_batch = tf.summary.merge(
+            [
+                summary_G_img_batch,
+            ],
+        )
         summary_op_D = tf.summary.merge([
             summary_Z,
             summary_D_real,
             summary_D_fake,
-            summary_loss_D_real,
-            summary_loss_D_fake,
             summary_loss_D,
         ])
         # ====================================================================
@@ -1616,19 +1609,52 @@ class AnoGAN(NeuralNetworkModel):
 
         # Optimization =======================================================
 
-        with tf.name_scope('dcgan_optimization'):
+        with tf.variable_scope('began_optimization'):
+
+            # for _ in range(10):
+            #     print(0.0005 * (0.6 ** _))
+            global_step = tf.Variable(
+                0,
+                trainable=False,
+                name='global_step',
+            )
+            if lr_decaying:
+                learning_rate_decay = tf.train.exponential_decay(
+                    learning_rate=Start_learning_rate_tensor,
+                    global_step=global_step,
+                    decay_steps=100000,
+                    decay_rate=.96,
+                    staircase=True,
+                    # decay_steps=20,
+                    # decay_rate=.0005,
+                    # staircase=True,
+                    name='learning_rate_decay',
+                )
+            else:
+                learning_rate_decay = Start_learning_rate_tensor
+
+            learning_rate_decay = tf.clip_by_value(
+                learning_rate_decay,
+                1e-5,
+                1e-4,
+            )
+
+            summary_learning_rate_decay = tf.summary.scalar(
+                'learning_rate',
+                learning_rate_decay,
+            )
 
             optimizer_G = tf.train.AdamOptimizer(
-                learning_rate=learning_rate,
+                learning_rate=learning_rate_decay,
                 beta1=adam_beta1,
-                beta2=0.999,
+                beta2=adam_beta2,
                 epsilon=1e-08,
                 name='optimizer_generator',
             )
             optimizer_D = tf.train.AdamOptimizer(
                 learning_rate=learning_rate,
                 beta1=adam_beta1,
-                beta2=0.999,
+                beta2=adam_beta2,
                 epsilon=1e-08,
                 name='optimizer_discriminator',
             )
@@ -1637,35 +1663,37 @@ class AnoGAN(NeuralNetworkModel):
                 loss_G,
                 var_list=tf.get_collection(
                     tf.GraphKeys.TRAINABLE_VARIABLES,
-                    scope="dcgan_model/generator",
-                )
+                    scope="began_model/generator",
+                ),
+                global_step=global_step,
             )
             train_op_D = optimizer_D.minimize(
                 loss_D,
                 var_list=tf.get_collection(
                     tf.GraphKeys.TRAINABLE_VARIABLES,
-                    scope="dcgan_model/discriminator",
-                )
+                    scope="began_model/discriminator",
+                ),
+                global_step=global_step,
             )
 
-        # variable_init_op_dcgan = tf.group(*[tf.global_variables_initializer(),
+        # variable_init_op_began = tf.group(*[tf.global_variables_initializer(),
         #                               tf.tables_initializer()])
-        variable_dcgan = tf.get_collection(
+        variable_began = tf.get_collection(
             tf.GraphKeys.GLOBAL_VARIABLES,
-            scope='dcgan_',
+            scope='began_',
         )
-        variable_init_op_dcgan = tf.group(
+        variable_init_op_began = tf.group(
             *[
                 tf.variables_initializer(
                     var_list = tf.get_collection(
                         tf.GraphKeys.GLOBAL_VARIABLES,
-                        scope='dcgan_model',
+                        scope='began_model',
                     )
                 ),
                 tf.variables_initializer(
                     var_list = tf.get_collection(
                         tf.GraphKeys.GLOBAL_VARIABLES,
-                        scope='dcgan_optimization',
+                        scope='began_optimization',
                     )
                 ),
             ],
@@ -1673,79 +1701,86 @@ class AnoGAN(NeuralNetworkModel):
 
         # ====================================================================
 
-        with tf.variable_scope("dcgan_metrics", reuse=reuse_ok):
-            metrics_train_dcgan = {
+        with tf.variable_scope("began_metrics", reuse=reuse_ok):
+            metrics_train_began = {
                 'Train_loss_G': tf.metrics.mean(loss_G),
                 'Train_loss_D': tf.metrics.mean(loss_D),
+                'Learing_rate': tf.metrics.mean(learning_rate_decay),
+
             }
-            metrics_valid_dcgan = {
+            metrics_valid_began = {
                 'Valid_loss_G': tf.metrics.mean(loss_G),
                 'Valid_loss_D': tf.metrics.mean(loss_D),
             }
 
         # Group the update ops for the tf.metrics
-        update_metrics_op_train_dcgan = tf.group(
-            *[op for _, op in metrics_train_dcgan.values()]
+        update_metrics_op_train_began = tf.group(
+            *[op for _, op in metrics_train_began.values()]
         )
-        update_metrics_op_valid_dcgan = tf.group(
-            *[op for _, op in metrics_valid_dcgan.values()]
+        update_metrics_op_valid_began = tf.group(
+            *[op for _, op in metrics_valid_began.values()]
         )
 
         # Get the op to reset the local variables used in tf.metrics
-        metrics_init_op_dcgan = tf.variables_initializer(
+        metrics_init_op_began = tf.variables_initializer(
             var_list=tf.get_collection(
                 tf.GraphKeys.LOCAL_VARIABLES,
-                scope="dcgan_metrics",
+                scope="began_metrics",
             ),
-            name='metrics_init_op_dcgan',
+            name='metrics_init_op_began',
         )
 
         # Return
-        self.variable_dcgan = variable_dcgan
-        self.variable_init_op_dcgan = variable_init_op_dcgan
+        self.variable_began = variable_began
+        self.variable_init_op_began = variable_init_op_began
 
         self.train_op_G = train_op_G
         self.train_op_D = train_op_D
 
-        self.metrics_train_dcgan = metrics_train_dcgan
-        self.metrics_valid_dcgan = metrics_valid_dcgan
-        self.update_metrics_op_train_dcgan = update_metrics_op_train_dcgan
-        self.update_metrics_op_valid_dcgan = update_metrics_op_valid_dcgan
-        self.metrics_init_op_dcgan = metrics_init_op_dcgan
+        self.metrics_train_began = metrics_train_began
+        self.metrics_valid_began = metrics_valid_began
+        self.update_metrics_op_train_began = update_metrics_op_train_began
+        self.update_metrics_op_valid_began = update_metrics_op_valid_began
+        self.metrics_init_op_began = metrics_init_op_began
 
         self.summary_op_G = summary_op_G
         self.summary_op_D = summary_op_D
-        #self.summary_op_G_batch = summary_op_G_batch
+        self.summary_op_G_batch = summary_op_G_batch
+        self.summary_learning_rate_decay = summary_learning_rate_decay
 
-        self.Input_X_dcgan = Input_X_dcgan
-        self.Input_Z_dcgan = Input_Z_dcgan
+        self.Input_X_began = Input_X_began
+        self.Input_Z_began = Input_Z_began
         self.Bool_is_training = Bool_is_training
-        self.Ratio_label_smoothing = Ratio_label_smoothing
+        self.Input_lambda = Input_lambda
+        self.Input_gamma = Input_gamma
+        self.Start_learning_rate_tensor = Start_learning_rate_tensor
 
+        # global_step = tf.train.get_global_step()
+        self.global_step = global_step
         self.G = G
         # self.S = S
         self.D_real = D_real_y
         self.D_fake = D_fake_y
         self.loss_G = loss_G
         self.loss_D = loss_D
-        self.loss_D_fake = loss_D_fake
-        self.loss_D_real = loss_D_real
+        self.K = K
+        self.update_K = update_K
+        self.convergence_measure = convergence_measure
 
 
-    def train_DCGAN(
+    def train_BEGAN(
         self,
-        input_x=None,
-        #input_x_filenames=None,
+        #input_x=None,
+        input_x_filenames=None,
         input_z=None,
         batch_size=64,
         drop_remainder=False,
         epoch_num=2,
-        learning_rate=None,
         validation_ratio=.2,
-        gen_train_advantage_ratio=.5,
-        gen_train_n_times=2,
-        label_smoothing=.1,
-        model_save_dir='./model_save/dcgan',
+        learning_rate=0.0005,
+        lambda_val=.001,
+        gamma_val=.7,
+        model_save_dir='./model_save/began',
         pre_trained_path=None,
         verbose=False,
         writer=None,
@@ -1772,16 +1807,14 @@ class AnoGAN(NeuralNetworkModel):
                  model_save_dir='model_save', pre_trained_path='model_save')
 
         """
-        metrics_train = self.metrics_train_dcgan
-        metrics_valid = self.metrics_valid_dcgan
+        metrics_train = self.metrics_train_began
+        metrics_valid = self.metrics_valid_began
 
-        #input_x = input_x_filenames
+        input_x = input_x_filenames
         # --------------------------------------------------------------------
-        #global_step = tf.train.get_global_step()
 
         self.LEARNING_RATE = learning_rate
         self.VALIDATION_RATIO = validation_ratio
-        self.LABEL_SMOOTHING = label_smoothing
 
         try:
             if not self.VALIDATION_RATIO or not (0 < self.VALIDATION_RATIO < 1):
@@ -1790,16 +1823,17 @@ class AnoGAN(NeuralNetworkModel):
                     self.VALIDATION_RATIO,
                 )
             else:
-                print("Training Parameter\n" +
-                      "'VALIDATION_RATIO=%s'" % self.VALIDATION_RATIO
-                )
+                pass
+                # print("Training Parameter\n" +
+                #       "'VALIDATION_RATIO=%s'" % self.VALIDATION_RATIO
+                # )
         except KeyError:
             raise NoValidValueException(
                 'validation_ratio',
                 None,
             )
         except NoValidValueException as err:
-            print(err)
+            # print(err)
             self.VALIDATION_RATIO = 0
 
         if batch_size is None:
@@ -1807,9 +1841,20 @@ class AnoGAN(NeuralNetworkModel):
         else:
             batch_size_int = int(batch_size)
 
-        print("'LEARNING_RATE=%s'" % learning_rate)
-        print("'BATCH_SIZE=%s'" % batch_size_int)
-        print("'EPOCH_NUM=%s'" % epoch_num)
+
+        parameter_dict = {
+            'VALIDATION_RATIO': self.VALIDATION_RATIO,
+            'DROPOUT': self.DROPOUT,
+            'LEARNING_RATE': self.LEARNING_RATE,
+            'LR_DECAYING': self.LR_DECAYING,
+            'BATCH_SIZE': batch_size_int,
+            'EPOCH_NUM': epoch_num,
+            'LAMBDA': lambda_val,
+            'GAMMA': gamma_val,
+            'ADAM_BETA1': self.ADAM_BETA1,
+            'ADAM_BETA2': self.ADAM_BETA2,
+        }
+        self._print_parameter(parameter_dict)
 
 
         self.input(
@@ -1823,50 +1868,9 @@ class AnoGAN(NeuralNetworkModel):
         )
 
 
-        try:
-            if not gen_train_advantage_ratio or not (0 < gen_train_advantage_ratio < 1):
-                raise NoValidValueException(
-                    'gen_train_advantage_ratio',
-                    gen_train_advantage_ratio,
-                )
-            else:
-                print("Training with " +
-                      "'GENERATOR Training Advantage Ratio=%s'" %
-                      gen_train_advantage_ratio
-                )
-        except KeyError:
-            raise NoValidValueException(
-                'gen_train_advantage_ratio',
-                None,
-            )
-        except NoValidValueException as err:
-            print(err)
-            gen_train_advantage_ratio = 0
-
-
-        try:
-            if not gen_train_n_times or not (gen_train_n_times < 1):
-                raise NoValidValueException(
-                    'gen_train_n_times',
-                    gen_train_n_times,
-                )
-            else:
-                print("Training with " +
-                      "'GENERATOR Training Advantage Time=%s'" %
-                      gen_train_n_times
-                )
-        except KeyError:
-            raise NoValidValueException(
-                'gen_train_n_times',
-                None,
-            )
-        except NoValidValueException as err:
-            print(err)
-            gen_train_n_times = 1
-
         # Initialize tf.Saver instances to save weights during training
         last_saver = tf.train.Saver(
-            var_list=self.variable_dcgan,
+            var_list=self.variable_began,
             max_to_keep=2,  # will keep last 5 epochs as default
             keep_checkpoint_every_n_hours=1.,
             name='saver',
@@ -1883,7 +1887,7 @@ class AnoGAN(NeuralNetworkModel):
                         model_save_dir
                     )
                     shutil.rmtree(model_save_dir, ignore_errors=False)
-                os.makedirs(model_save_dir, exist_ok=True)
+                os.makedirs(model_save_dir, exist_ok=False)
 
             # Reload weights from directory if specified
             elif pre_trained_path is not None:
@@ -1909,6 +1913,7 @@ class AnoGAN(NeuralNetworkModel):
                     print("Restoring parameters from {}".format(saved_model))
 
 
+            global_epoch = begin_at_epoch
             # For TensorBoard (takes care of writing summaries to files)
             train_writer = tf.summary.FileWriter(
                 logdir=os.path.join(
@@ -1936,7 +1941,7 @@ class AnoGAN(NeuralNetworkModel):
 
 
             # Initialize model variables
-            sess.run(self.variable_init_op_dcgan)
+            sess.run(self.variable_init_op_began)
 
             for epoch in range(begin_at_epoch, epoch_num):
 
@@ -1945,12 +1950,12 @@ class AnoGAN(NeuralNetworkModel):
                 sess.run(
                     self.data_init_op,
                     feed_dict={
-                        self._x_input_tensor: input_x,
-                        #self._x_input_filename_tensor: input_x,
+                        #self._x_input_tensor: input_x,
+                        self._x_input_filename_tensor: input_x,
                         self._z_input_tensor: input_z,
                     }
                 )
-                sess.run(self.metrics_init_op_dcgan)
+                sess.run(self.metrics_init_op_began)
 
                 if not verbose:
                     epoch_msg = "\rEpoch %d/%d " % (epoch + 1, epoch_num)
@@ -1969,19 +1974,9 @@ class AnoGAN(NeuralNetworkModel):
                 else:
                     train_len = batch_len
 
-                # global_step = epoch + 1
+                global_epoch = epoch + 1
                 # print(global_step)
 
-                gen_adv_step = int(
-                    train_len * gen_train_advantage_ratio
-                )
-
-
-                err_G = 1.
-                err_D_fake, err_D_real = .5, .5
-                err_D = err_D_fake + err_D_real
-                err_G_ratio_upper_limit = .7
-                err_D_ratio_upper_limit = .7
                 batch_remains_ok = True
                 while batch_remains_ok and (batch_num <= batch_len):
                     try:
@@ -1989,105 +1984,76 @@ class AnoGAN(NeuralNetworkModel):
 
                             X_batch, Z_batch = sess.run(self.next_batch)
 
-                            total_err = np.array(
-                                [err_G, err_D]
+                            #K_val = sess.run(self.K)
+                            (_,
+                             _,
+                             _,
+                             summary_str_G_train,
+                             summary_str_D_train,
+                             summary_learning_rate,
+                             global_step) = sess.run(
+                                [
+                                    self.train_op_G,
+                                    self.train_op_D,
+                                    self.update_K,
+                                    self.summary_op_G,
+                                    self.summary_op_D,
+                                    self.summary_learning_rate_decay,
+                                    self.global_step,
+                                ],
+                                feed_dict={
+                                    self.Input_X_began: X_batch,
+                                    self.Input_Z_began: Z_batch,
+                                    self.Bool_is_training: True,
+                                    self.Input_lambda: lambda_val,
+                                    self.Input_gamma: gamma_val,
+                                    #self.K: min(max(K_val, 0), 1),
+                                    self.Start_learning_rate_tensor: self.LEARNING_RATE,
+                                },
                             )
-                            err_G_ratio, err_D_ratio = total_err / total_err.sum()
-                            err_D_fake_ratio = err_D_fake / err_D
-
-                            # Optimize Generator first.
-                            if (
-                                # (err_D <= err_G_ratio_upper_limit)
-                                # and
-                                (batch >= gen_adv_step)
-                                ):
-                                _, summary_str_D_train = sess.run(
-                                    [
-                                        self.train_op_D,
-                                        self.summary_op_D,
-                                    ],
-                                    feed_dict={
-                                        self.Input_X_dcgan: X_batch,
-                                        self.Input_Z_dcgan: Z_batch,
-                                        self.Bool_is_training: True,
-                                        self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
-                                    },
-                                )
-                                err_D_fake = self.loss_D_fake.eval(
-                                    {
-                                        self.Input_Z_dcgan: Z_batch,
-                                        self.Bool_is_training: False,
-                                        self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
-                                    }
-                                )
-                                err_D_real = self.loss_D_real.eval(
-                                    {
-                                        self.Input_X_dcgan: X_batch,
-                                        self.Bool_is_training: False,
-                                        self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
-                                    }
-                                )
-                            else:
-                                # err_D_fake, err_D_real = 0., 0.
-                                pass
-
-                            err_D = (err_D_fake + err_D_real) / 2.
-
-                            if (
-                                # (err_D_fake_ratio <= err_D_ratio_upper_limit)
-                                # and
-                                (gen_train_n_times)
-                                ):
-                                for n_time in range(gen_train_n_times):
-
-                                     sess.run(
-                                        [
-                                            self.train_op_G,
-                                        ],
-                                        feed_dict={
-                                            self.Input_Z_dcgan: Z_batch,
-                                            self.Bool_is_training: True,
-                                            self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
-                                        },
-                                    )
-
-                                summary_str_G_train, err_G = sess.run(
-                                    [
-                                        self.summary_op_G,
-                                        self.loss_G,
-                                    ],
-                                    feed_dict={
-                                        self.Input_Z_dcgan: Z_batch,
-                                        self.Bool_is_training: False,
-                                        self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
-                                    },
-                                )
+                            err_G = self.loss_G.eval(
+                                {
+                                    self.Input_Z_began: Z_batch,
+                                    self.Bool_is_training: False,
+                                }
+                            )
+                            err_D = self.loss_D.eval(
+                                {
+                                    self.Input_X_began: X_batch,
+                                    self.Input_Z_began: Z_batch,
+                                    self.Bool_is_training: False,
+                                }
+                            )
 
                             if batch % 10 == 1:
-                                # summary_G_batch = sess.run(
-                                #     self.summary_op_G_batch,
-                                #     feed_dict={
-                                #         self.Input_Z_dcgan: Z_batch,
-                                #         self.Bool_is_training: False,
-                                #         self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
-                                #     },
-                                # )
-                                # batch_writer.add_summary(
-                                #     summary_G_batch,
-                                #     batch,
-                                # )
-                                pass
+                                summary_G_batch = sess.run(
+                                    self.summary_op_G_batch,
+                                    feed_dict={
+                                        self.Input_Z_began: Z_batch,
+                                        self.Bool_is_training: False,
+                                        self.Input_lambda: lambda_val,
+                                        self.Input_gamma: gamma_val,
+                                        #self.K: min(max(K_val, 0), 1),
+                                    },
+                                )
+                                batch_writer.add_summary(
+                                    summary_G_batch,
+                                    batch,
+                                )
 
                             sess.run(
                                 [
-                                    self.update_metrics_op_train_dcgan,
-                                    #self.metrics_train_dcgan,
+                                    self.update_metrics_op_train_began,
+                                    #self.metrics_train_began,
                                 ],
                                 feed_dict={
-                                    self.Input_X_dcgan: X_batch,
-                                    self.Input_Z_dcgan: Z_batch,
+                                    self.Input_X_began: X_batch,
+                                    self.Input_Z_began: Z_batch,
                                     self.Bool_is_training: False,
-                                    self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
+                                    self.Input_lambda: lambda_val,
+                                    self.Input_gamma: gamma_val,
+                                    #self.K: min(max(K_val, 0), 1),
+                                    self.Start_learning_rate_tensor: self.LEARNING_RATE,
                                 },
                             )
                             # -----------------------------------------------
@@ -2101,7 +2067,7 @@ class AnoGAN(NeuralNetworkModel):
                                 batch_pct = int(20 * batch_num / train_len)
                                 batch_bar = "[%s] " % (("#" * batch_pct) + ("-" * (20 - batch_pct)))
                                 batch_msg = "\rBatch [%s/%s] " % (batch_num, train_len)
-                                batch_err = 'G: %.5s D_fake: %.5s D_real: %.5s ' % (err_G, err_D_fake, err_D_real)
+                                batch_err = 'G: %.5s D: %.5s ' % (err_G, err_D)
 
                                 batch_msg = batch_msg + batch_bar + batch_err
 
@@ -2122,14 +2088,16 @@ class AnoGAN(NeuralNetworkModel):
                                     [
                                         self.summary_op_G,
                                         self.summary_op_D,
-                                        self.update_metrics_op_valid_dcgan,
-                                        #self.metrics_valid_dcgan,
+                                        self.update_metrics_op_valid_began,
+                                        #self.metrics_valid_began,
                                     ],
                                     feed_dict={
-                                        self.Input_X_dcgan: X_batch,
-                                        self.Input_Z_dcgan: Z_batch,
+                                        self.Input_X_began: X_batch,
+                                        self.Input_Z_began: Z_batch,
                                         self.Bool_is_training: False,
-                                        self.Ratio_label_smoothing: self.LABEL_SMOOTHING,
+                                        self.Input_lambda: lambda_val,
+                                        self.Input_gamma: gamma_val,
+                                        #self.K: min(max(K_val, 0), 1),
                                     },
                                 )
                             # -----------------------------------------------
@@ -2139,7 +2107,7 @@ class AnoGAN(NeuralNetworkModel):
                                     valid_pct = int(20 * valid_num / valid_len)
                                     valid_bar = "[%s] " % (("#" * valid_pct) + ("-" * (20 - valid_pct)))
                                     valid_msg = "\rValid [%s/%s] " % (valid_num, valid_len)
-                                    valid_err = 'G: %.5f D_fake: %.5s D_real: %.5s ' % (err_G, err_D_fake, err_D_real)
+                                    valid_err = 'G: %.5f D: %.5s ' % (err_G, err_D)
 
                                     valid_msg = valid_msg + valid_bar + valid_err
 
@@ -2160,9 +2128,12 @@ class AnoGAN(NeuralNetworkModel):
                     summary_str_G_train,
                     epoch,
                 )
-
                 train_writer.add_summary(
                     summary_str_D_train,
+                    epoch,
+                )
+                train_writer.add_summary(
+                    summary_learning_rate,
                     epoch,
                 )
 
@@ -2210,7 +2181,7 @@ class AnoGAN(NeuralNetworkModel):
                     #     metrics_str,
                     #     sep='\n',
                     # )
-                    sys.stdout.write(metrics_str + '\n')
+                    sys.stdout.write('\n' + metrics_str + '\n')
 
                 else:
 
@@ -2241,11 +2212,12 @@ class AnoGAN(NeuralNetworkModel):
                         model_save_dir,
                         'last_weights',
                         'after-epoch',
+                        #'after-step',
                     )
                     last_saver.save(
                         sess,
                         last_save_path,
-                        global_step=epoch + 1,
+                        global_step=epoch,
                     )
 
         print('\nTraining has been Finished.')
@@ -2256,7 +2228,7 @@ class AnoGAN(NeuralNetworkModel):
         )
         print(
             'Latest Model Saved >> %s-%s' %
-            (last_save_path, epoch + 1)
+            (last_save_path, epoch)
         )
 
 
@@ -2308,7 +2280,7 @@ class AnoGAN(NeuralNetworkModel):
                 name='anomaly_z_distributor',
             )
 
-        with tf.variable_scope('dcgan_model', reuse=True):
+        with tf.variable_scope('began_model', reuse=True):
             ano_G = self._graph_sampler(
                 z=ano_Z,
                 filter_size=5,
@@ -2327,7 +2299,7 @@ class AnoGAN(NeuralNetworkModel):
 
         if use_featuremap:
 
-            with tf.variable_scope('dcgan_model', reuse=True):
+            with tf.variable_scope('began_model', reuse=True):
                 feature_D_from_X = self._graph_discriminator_featuremap(
                     Input_X_anogan,
                     filter_size=5,
@@ -2360,7 +2332,7 @@ class AnoGAN(NeuralNetworkModel):
 
         else:
 
-            with tf.variable_scope('dcgan_model', reuse=True):
+            with tf.variable_scope('began_model', reuse=True):
                 test_D = self._graph_discriminator(
                     input_x=ano_G,
                     filter_size=5,
@@ -2434,7 +2406,7 @@ class AnoGAN(NeuralNetworkModel):
 
         # ====================================================================
 
-        # variable_init_op_dcgan = tf.group(*[tf.global_variables_initializer(),
+        # variable_init_op_began = tf.group(*[tf.global_variables_initializer(),
         #                               tf.tables_initializer()])
         variable_anogan = tf.get_collection(
             tf.GraphKeys.GLOBAL_VARIABLES,
@@ -2519,8 +2491,6 @@ class AnoGAN(NeuralNetworkModel):
         self,
         input_x=None,
         input_z=None,
-        batch_size=None,
-        drop_remainder=False,
         epoch_num=2,
         model_save_dir='./model_save_anogan',
         pre_trained_path=None,
@@ -2586,7 +2556,7 @@ class AnoGAN(NeuralNetworkModel):
                 graph=sess.graph,
             )
             # Initialize model variables
-            sess.run(self.variable_init_op_dcgan)
+            sess.run(self.variable_init_op_began)
             sess.run(self.variable_init_op_anogan)
 
             # Reload weights from directory if specified
@@ -2741,11 +2711,11 @@ class AnoGAN(NeuralNetworkModel):
             print("Training Finished!")
 
 
-    def evaluate_DCGAN(
+    def evaluate_BEGAN(
         self,
         #input_x=None,
         input_z=None,
-        pre_trained_path='./model_save',
+        pre_trained_path='./model_save/began',
         target_epoch=None,
         ):
         """Short Description.
@@ -2770,7 +2740,7 @@ class AnoGAN(NeuralNetworkModel):
 
         if self.G is None:
             tf.reset_default_graph()
-            self.build_DCGAN(
+            self.build_began(
                 learning_rate = self.LEARNING_RATE,
                 adam_beta1 = self.ADAM_BETA1,
                 dropout=self.DROPOUT,
@@ -2778,7 +2748,7 @@ class AnoGAN(NeuralNetworkModel):
 
         with tf.Session() as sess:
             ## Initialize model variables
-            sess.run(self.variable_init_op_dcgan)
+            sess.run(self.variable_init_op_began)
 
             # Reload weights from directory if specified
             if pre_trained_path is not None:
@@ -2808,42 +2778,11 @@ class AnoGAN(NeuralNetworkModel):
             pred = sess.run(
                 self.G,
                 feed_dict={
-                    self.Input_Z_dcgan: input_z,
+                    self.Input_Z_began: input_z,
                     self.Bool_is_training: False,
                 }
             )
 
             pred_img = (pred + 1.) / 2. * 255
-            # Input_X_dcgan = tf.placeholder(
-            #     self._x_input_tensor.dtype,
-            #     self._x_input_tensor.get_shape(),
-            #     name='input_x_dcgan',
-            # )
-            # Input_Z_dcgan = tf.placeholder(
-            #     self._z_input_tensor.dtype,
-            #     self._z_input_tensor.get_shape(),
-            #     name='input_z_dcgan',
-            # )
-            #
-            # # dcgan_generator = tf.get_collection(
-            # #     tf.GraphKeys.GLOBAL_VARIABLES,
-            # #     #scope='dcgan_model',
-            # # )
-            # G = tf.get_collection(
-            #     'generator',
-            #     scope='dcgan_model',
-            # )
-            # #pred = sess.run(G, feed_dict={Input_Z_dcgan: input_z})
-            # pred = sess.run(G, input_z)
 
-        #tf.get_default_graph().get_tensor_by_name('input')
         return pred_img
-
-
-    def loss_plot(self):
-        fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 3))
-        ax.plot(self.train_loss_history, label='train')
-        if self.VALIDATION_RATIO:
-            ax.plot(self.train_valid_history, label='valid')
-        #ax.set_xticks(np.arange(self.))
-        return fig

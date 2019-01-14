@@ -6,21 +6,18 @@
 import tensorflow as tf
 import os
 import shutil
-
+print(os.getcwd())
 if os.getcwd().split('/')[-1] != 'dcgan':
     os.chdir('../git/dcgan')
-
-print(os.getcwd())
 
 # !python download.py celebA
 
 import numpy as np
 import matplotlib as mpl
-from matplotlib import cm
 import matplotlib.pyplot as plt
+from skimage.io import imread_collection, imsave
+from skimage.transform import resize
 from sklearn.model_selection import train_test_split
-
-tf.__version__
 
 # %% Data Preprocessing ------------------------------------------------------
 
@@ -128,8 +125,9 @@ tf.__version__
 from glob import glob
 
 
-data_x = glob('./data/celebA/*.jpg')
-# data_x = glob('./data/data_crop_256_jpg/*.jpg')
+#data_x_filenames = glob('/Users/soheehwang/Downloads/DCGAN-tensorflow-master/samples/*.png')
+# data_x = glob('./data/celebA/*.jpg')
+data_x = glob('./data/data_crop_256_jpg/*.jpg')
 # plt.imshow(data_x[0])
 print('`data_x` is ready:', len(data_x))
 
@@ -142,7 +140,7 @@ print('`data_x` is ready:', len(data_x))
 data_z = np.random.uniform(
     low=0.,
     high=1.,
-    size=(len(data_x), 100),
+    size=(len(data_x), 64),
 ).astype(np.float32)
 
 print('`data_z` is ready:', data_z.shape, data_z.dtype)
@@ -162,18 +160,17 @@ data_onevector = np.ones_like(data_z)
 # %% AnoGAN: Build -----------------------------------------------------------
 
 import importlib
-from src.anogan import anogan as ANOGAN
-importlib.reload(ANOGAN)
-AnoGAN = ANOGAN.AnoGAN
+from src.began import began as BeGAN
+importlib.reload(BeGAN)
+BEGAN = BeGAN.BEGAN
 
 tf.reset_default_graph()
-anogan = AnoGAN(
+began = BEGAN(
     input_x_ext='jpg',
     input_x_dtype=tf.float32,
-    # input_x_dtype=tf.string,
     input_z_dtype=tf.float32,
     input_x_shape=(None, 256, 256, 3),
-    input_z_shape=(None, 100),
+    input_z_shape=(None, 64),
     use_gpu=True,
     #input_width=64,
     #input_height=64,
@@ -182,39 +179,60 @@ anogan = AnoGAN(
     # output_height=None,
     # output_channel=None,
     # class_num=1,
-    filter_dim=32,
+    filter_dim=64,  # 128
     # g_filter_dim=64,
     # d_filter_dim=64,
     g_fc_dim=1024,
     d_fc_dim=1024,
     batch_size=64,
     dropout=None,
+    lr_decaying=False,
     buffer_size=1000,
-    learning_rate=0.0002,
-    label_smoothing=.1,
+    learning_rate=0.0005,
     adam_beta1=.5,
+    adam_beta2=.9,
     validation_ratio=.2,
     ano_lambda_=.1,
-    use_featuremap=True,
+)
+
+# %% AnoGAN: Train DCGAN -----------------------------------------------------
+
+shutil.rmtree('./model_save/began_origin', ignore_errors=True)
+
+# %%
+
+began.train_BEGAN(
+    #input_x=train_x,
+    input_x_filenames=train_x,
+    input_z=train_z,
+    batch_size=16,
+    epoch_num=5,
+    validation_ratio=.05,
+    learning_rate=5e-4,
+    lambda_val=.001,
+    gamma_val=.7,
+    model_save_dir='./model_save/began_origin',
+    #pre_trained_path='./model_save/began_origin',
+    pre_trained_path=None,
+    verbose=True,
+    #writer=None,
 )
 
 
 # %% AnoGAN: Train DCGAN -----------------------------------------------------
 
-shutil.rmtree('./model_save/dcgan_256', ignore_errors=True)
-anogan.train_DCGAN(
-    input_x=train_x,
-    # input_x_filenames=train_x,
+began.train_BEGAN(
+    #input_x=train_x,
+    input_x_filenames=train_x,
     input_z=train_z,
     batch_size=32,
-    epoch_num=100,
-    validation_ratio=.1,
-    learning_rate=.0002,
-    gen_train_advantage_ratio=.0,
-    gen_train_n_times=3,
-    label_smoothing=.1,
-    model_save_dir='./model_save/dcgan_256',
-    # pre_trained_path='./model_save/dcgan_256',
+    epoch_num=50,
+    validation_ratio=.05,
+    learning_rate=.0003,
+    lambda_val=.001,
+    gamma_val=.7,
+    model_save_dir='./model_save/began_origin',
+    pre_trained_path='./model_save/began_origin',
     #pre_trained_path=None,
     verbose=True,
     #writer=None,
@@ -223,7 +241,7 @@ anogan.train_DCGAN(
 
 # %% AnoGAN: Evaluate DCGAN --------------------------------------------------
 
-gen_x = anogan.evaluate_DCGAN(
+gen_x = began.evaluate_BEGAN(
     input_z=test_z[:1],
     pre_trained_path='model_save_dcgan_origin',
     target_epoch=5,
@@ -241,9 +259,10 @@ type(gen_x)
 
 gen_x
 
+
 # %% AnoGAN: Train AnoGAN ----------------------------------------------------
 
-anogan.train_AnoGAN(
+began.train_BEGAN(
     input_x=train_x,
     input_z=train_onevector,
     epoch_num=1,
@@ -251,6 +270,15 @@ anogan.train_AnoGAN(
     pre_trained_path=None,
     verbose=True,
     writer=None,
+)
+
+
+# %% AnoGAN: Evaluate AnoGAN -------------------------------------------------
+
+gen_x = began.evaluate_BEGAN(
+    input_z=test_z[:1],
+    pre_trained_path='model_save_dcgan_origin',
+    target_epoch=5,
 )
 
 # %% Test Code: tf.data.Dataset ----------------------------------------------
