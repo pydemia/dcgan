@@ -97,8 +97,11 @@ class BEGAN(NeuralNetworkModel):
         g_fc_dim=1024,
         d_fc_dim=1024,
         batch_size=128,
+        batch_norm_ok=False,
+        conv_activation=tf.nn.elu,
         dropout=.3,
         lr_decaying=True,
+        decay_lr_step=100_000,
         buffer_size=1000,
         learning_rate=.0002,
         adam_beta1=.8,
@@ -153,8 +156,11 @@ class BEGAN(NeuralNetworkModel):
         self.FILTER_DIM = filter_dim
 
         self.BATCH_SIZE = batch_size              # Training Batch Size
+        self.BATCH_NORM_OK = batch_norm_ok
+        self.CONV_ACTIVATION = conv_activation
         self.DROPOUT = dropout
         self.LR_DECAYING = lr_decaying
+        self.DECAY_LR_STEP = decay_lr_step
         self.BUFFER_SIZE = buffer_size            # For tf.Dataset.suffle(buffer_size)
         self.LEARNING_RATE = learning_rate        # Learning rate (Fixed for now)
         self.ADAM_BETA1 = adam_beta1
@@ -192,21 +198,23 @@ class BEGAN(NeuralNetworkModel):
 
         tf.reset_default_graph()
 
-        self.input(
-            batch_size=self.BATCH_SIZE,
-            input_x_dtype=self.input_x_dtype,
-            input_z_dtype=self.input_z_dtype,
-            input_x_shape=self.input_x_shape,
-            input_z_shape=self.input_z_shape,
-            is_training=True,
-        )
+        # self.input(
+        #     batch_size=self.BATCH_SIZE,
+        #     input_x_dtype=self.input_x_dtype,
+        #     input_z_dtype=self.input_z_dtype,
+        #     input_x_shape=self.input_x_shape,
+        #     input_z_shape=self.input_z_shape,
+        #     is_training=True,
+        # )
 
         self.build_BEGAN(
-            lr_decaying=True,
+            batch_norm_ok=self.BATCH_NORM_OK,
+            conv_activation=self.CONV_ACTIVATION,
+            dropout=self.DROPOUT,
+            lr_decaying=self.LR_DECAYING,
             learning_rate=self.LEARNING_RATE,
             adam_beta1=self.ADAM_BETA1,
             adam_beta2=self.ADAM_BETA2,
-            dropout=self.DROPOUT,
         )
         # self.build_AnoGAN(
         #     learning_rate = self.LEARNING_RATE,
@@ -314,11 +322,20 @@ class BEGAN(NeuralNetworkModel):
         parameter_dict,
         ):
 
+        string_format = ''.join(
+            [
+                '| {prmt_key:18s}',
+                ': '
+                '{prmt_val:>8s} |',
+            ]
+        )
         parameter_str = "\n".join(
-            f"| {prmt_key:18s}: {str(prmt_value):>8s} |"
-            #if isinstance(prmt_value, (int, float, complex))
-            #else f"{prmt_key:15s}\t: {prmt_value:>8s}"
-            for prmt_key, prmt_value in parameter_dict.items()
+            # f"| {prmt_key:18s}: {str(prmt_value):>8s} |"
+            string_format.format(
+                prmt_key=prmt_key,
+                prmt_val=str(prmt_val),
+            )
+            for prmt_key, prmt_val in parameter_dict.items()
         )
         print(
             "=" * 7 + " Given Parameters " +  "=" * 7,
@@ -696,7 +713,7 @@ class BEGAN(NeuralNetworkModel):
         stride_size=1,
         stddev=.02,
         batch_norm_ok=True,
-        activation=tf.nn.elu,
+        activation=tf.nn.relu,
         dropout=.3,
         reuse=tf.AUTO_REUSE,
         name='conv2d',
@@ -846,7 +863,7 @@ class BEGAN(NeuralNetworkModel):
         stride_size=1,
         stddev=.02,
         batch_norm_ok=True,
-        activation=tf.nn.elu,
+        activation=tf.nn.relu,
         dropout=.3,
         name='conv2d_t',
         reuse=tf.AUTO_REUSE,
@@ -1019,7 +1036,7 @@ class BEGAN(NeuralNetworkModel):
         # channel_dim,
         filter_size=3,
         stride_size=1,
-        activation=tf.nn.elu,
+        conv_activation=tf.nn.elu,
         dropout=None,
         is_training=True,
         reuse=tf.AUTO_REUSE,
@@ -1064,7 +1081,7 @@ class BEGAN(NeuralNetworkModel):
                     filter_size=filter_size,
                     stride_size=stride_size + 1,
                     batch_norm_ok=False,
-                    activation=activation,
+                    activation=conv_activation,
                     dropout=dropout,
                     name='d_sampling_%s' % (i),
                     is_training=is_training,
@@ -1083,7 +1100,7 @@ class BEGAN(NeuralNetworkModel):
                         filter_size=filter_size,
                         stride_size=stride_size,
                         batch_norm_ok=False,
-                        activation=activation,
+                        activation=conv_activation,
                         dropout=dropout,
                         name='conv2d_%s_%s' % (i, _),
                         is_training=is_training,
@@ -1125,7 +1142,7 @@ class BEGAN(NeuralNetworkModel):
         # channel_dim,
         filter_size=3,
         stride_size=1,
-        activation=tf.nn.elu,
+        conv_activation=tf.nn.elu,
         dropout=None,
         is_training=True,
         reuse=tf.AUTO_REUSE,
@@ -1160,30 +1177,32 @@ class BEGAN(NeuralNetworkModel):
             projection_size = (
                 height_arr[0] * width_arr[0] * channel
             )
-            proj_z = self._layer_dense(
-                input_z,
-                output_size=projection_size,
-                batch_norm_ok=False,
-                activation=None,
-                dropout=dropout,
-                is_training=is_training,
-                name='proj_z_dense',
-            )
-            reshaped_proj_z = self._layer_reshape(
-                proj_z,
-                output_shape=(
-                    -1,  # `tf.reshape` needs -1, not `None`
-                    height_arr[0],
-                    width_arr[0],
-                    channel,
-                ),
-                batch_norm_ok=False,
-                activation=None,
-                dropout=dropout,
-                name='reshaped_proj_z',
-                is_training=is_training,
-            )
-            final_layer = reshaped_proj_z
+
+            with tf.name_scop('projection'):
+                proj_z = self._layer_dense(
+                    input_z,
+                    output_size=projection_size,
+                    batch_norm_ok=False,
+                    activation=None,
+                    dropout=dropout,
+                    is_training=is_training,
+                    name='proj_z_dense',
+                )
+                reshaped_proj_z = self._layer_reshape(
+                    proj_z,
+                    output_shape=(
+                        -1,  # `tf.reshape` needs -1, not `None`
+                        height_arr[0],
+                        width_arr[0],
+                        channel,
+                    ),
+                    batch_norm_ok=False,
+                    activation=None,
+                    dropout=dropout,
+                    name='reshaped_proj_z',
+                    is_training=is_training,
+                )
+                final_layer = reshaped_proj_z
 
             for i in range(stacked_num):
                 if i > 0:
@@ -1203,6 +1222,7 @@ class BEGAN(NeuralNetworkModel):
                     final_layer = resized
 
                 for _ in range(2):
+
                     conv2d = self._layer_conv2d(
                         final_layer,
                         output_size=(
@@ -1214,7 +1234,7 @@ class BEGAN(NeuralNetworkModel):
                         filter_size=filter_size,
                         stride_size=stride_size,
                         batch_norm_ok=False,
-                        activation=activation,
+                        activation=conv_activation,
                         dropout=dropout,
                         name='conv2d_%s_%s' % (i, _),
                         is_training=is_training,
@@ -1251,7 +1271,7 @@ class BEGAN(NeuralNetworkModel):
         # filter_size=5,
         # stride_size=2,
         dropout=None,
-        activation=tf.nn.elu,
+        conv_activation=tf.nn.elu,
         reuse=tf.AUTO_REUSE,
         name='generator',
         ):
@@ -1263,7 +1283,7 @@ class BEGAN(NeuralNetworkModel):
             decoded = self._subgraph_decoder(
                 z,
                 is_training=is_training,
-                activation=activation,
+                conv_activation=conv_activation,
                 dropout=dropout,
                 reuse=reuse,
             )
@@ -1278,7 +1298,7 @@ class BEGAN(NeuralNetworkModel):
         # filter_size=5,
         # stride_size=2,
         dropout=None,
-        activation=tf.nn.elu,
+        conv_activation=tf.nn.elu,
         reuse=tf.AUTO_REUSE,
         name='discriminator',
         return_all_layers=False,
@@ -1291,14 +1311,14 @@ class BEGAN(NeuralNetworkModel):
             encoded = self._subgraph_encoder(
                 input_x,
                 is_training=is_training,
-                activation=activation,
+                conv_activation=conv_activation,
                 dropout=dropout,
                 reuse=reuse,
             )
             decoded = self._subgraph_decoder(
                 encoded,
                 is_training=is_training,
-                activation=activation,
+                conv_activation=conv_activation,
                 dropout=dropout,
                 reuse=reuse,
             )
@@ -1322,15 +1342,15 @@ class BEGAN(NeuralNetworkModel):
             return decoded
 
     def _graph_sampler(
-        self,
-        z,
-        is_training=False,
-        # filter_size=5,
-        # stride_size=2,
-        dropout=None,
-        name='sampler',
-        generator_name='generator',
-        ):
+            self,
+            z,
+            is_training=False,
+            # filter_size=5,
+            # stride_size=2,
+            dropout=None,
+            name='sampler',
+            generator_name='generator',
+            ):
 
         self._print_scope(name)
 
@@ -1410,11 +1430,13 @@ class BEGAN(NeuralNetworkModel):
 
     def build_BEGAN(
         self,
+        batch_norm_ok=False,
+        conv_activation=tf.nn.elu,
+        dropout=None,
         lr_decaying=True,
         learning_rate=.0002,
         adam_beta1=.5,
         adam_beta2=.8,
-        dropout=None,
         ):
         """Short Description.
 
@@ -1487,6 +1509,7 @@ class BEGAN(NeuralNetworkModel):
                 z=Input_Z_began,  # z=Z_batch,
                 # filter_size=5,
                 # stride_size=2,
+                conv_activation=self.CONV_ACTIVATION,
                 dropout=dropout,
                 is_training=Bool_is_training,
                 name='generator',
@@ -1496,6 +1519,7 @@ class BEGAN(NeuralNetworkModel):
                 input_x=Input_X_began,  # input_x=X_batch,
                 # filter_size=5,
                 # stride_size=2,
+                conv_activation=self.CONV_ACTIVATION,
                 dropout=dropout,
                 is_training=Bool_is_training,
                 reuse=tf.AUTO_REUSE,
@@ -1513,6 +1537,7 @@ class BEGAN(NeuralNetworkModel):
                 input_x=G,
                 # filter_size=5,
                 # stride_size=2,
+                conv_activation=self.CONV_ACTIVATION,
                 dropout=dropout,
                 is_training=Bool_is_training,
                 reuse=True,
@@ -1622,7 +1647,7 @@ class BEGAN(NeuralNetworkModel):
                 learning_rate_decay = tf.train.exponential_decay(
                     learning_rate=Start_learning_rate_tensor,
                     global_step=global_step,
-                    decay_steps=100000,
+                    decay_steps=self.DECAY_LR_STEP,
                     decay_rate=.96,
                     staircase=True,
                     # decay_steps=20,
@@ -2038,7 +2063,7 @@ class BEGAN(NeuralNetworkModel):
                                 )
                                 batch_writer.add_summary(
                                     summary_G_batch,
-                                    batch,
+                                    global_step,
                                 )
 
                             sess.run(
